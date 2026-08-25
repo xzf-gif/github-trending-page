@@ -1,18 +1,18 @@
 name: Daily refresh
 
-# 北京时间中午 12 点 = UTC 04:00。GitHub Actions 的 cron 用 UTC。
-# GitHub Actions 的 schedule 经常延迟数小时甚至跳过(尤其是高峰时段),
-# 所以排两个 cron 提高 hit 率。两次都跑没坏处:workflow 内部会先看 trending
-# 页拉到的数据跟 index.html 里的对不对得上,没新内容就 git commit 步骤直接 skip。
+# 北京时间中午 12 点 = UTC 04:00
+# 额外设置一个 cron 作为备用，避免 GitHub Actions 的 schedule 延迟。
 on:
   schedule:
-    - cron: '0 4 * * *'   # 主:12:00 北京时间
-    - cron: '30 5 * * *'  # 备:13:30 北京时间(主 cron 跳过/延迟时兜底)
-  workflow_dispatch: {}  # 允许从 Actions 页面手动触发
+    - cron: '0 4 * * *'
+    - cron: '30 5 * * *'
+
+  # 允许在 GitHub Actions 页面手动运行
+  workflow_dispatch: {}
 
 permissions:
-  contents: write  # 允许 commit 回 main
-  issues: write    # 失败时创建/评论 issue 触发邮件通知
+  contents: write
+  issues: write
 
 concurrency:
   group: daily-refresh
@@ -22,6 +22,7 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,30 +34,26 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      # 使用阿里云百炼 / Qwen 构建
       - name: Build index.html
         env:
-          # ----- Primary provider -----
-          # 默认走官方 https://generativelanguage.googleapis.com/v1beta
-          # 把 primary 切到代理:在 vars 里设 GEMINI_BASE_URL=http://... + GEMINI_API_VERSION=v1beta
-          # 并把 GEMINI_API_KEY secret 改成代理的 key
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
-          GEMINI_BASE_URL: ${{ vars.GEMINI_BASE_URL }}
-          GEMINI_API_VERSION: ${{ vars.GEMINI_API_VERSION }}
-          # ----- Fallback provider (used automatically if primary fails) -----
-          # 只要 GEMINI_FALLBACK_API_KEY secret 存在,build 就会在 primary 5 次重试都败之后切到 fallback。
-          # 通常 fallback 配成第三方代理,与 primary 互为备份。
-          GEMINI_FALLBACK_API_KEY: ${{ secrets.GEMINI_FALLBACK_API_KEY }}
-          GEMINI_FALLBACK_BASE_URL: ${{ vars.GEMINI_FALLBACK_BASE_URL }}
-          GEMINI_FALLBACK_API_VERSION: ${{ vars.GEMINI_FALLBACK_API_VERSION }}
-          GEMINI_FALLBACK_MODEL: ${{ vars.GEMINI_FALLBACK_MODEL }}
+          BAILIAN_API_KEY: ${{ secrets.BAILIAN_API_KEY }}
+
+          # 默认模型，可以改成你想使用的百炼模型
+          BAILIAN_MODEL: qwen-plus
+
+          # 阿里云百炼 OpenAI 兼容接口
+          BAILIAN_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+
         run: node scripts/build.mjs
 
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add index.html
+
           if git diff --staged --quiet; then
             echo "no changes — skipping commit"
           else
@@ -65,12 +62,11 @@ jobs:
             git push
           fi
 
-      # 失败通知:GitHub 默认会给 cron 失败发邮件,但有时被忽略。
-      # 这里再加一层:同一个开口 issue 上累计评论。每条新评论也会触发邮件,
-      # 而且在 repo Issues 里能直接看到失败历史。
+      # 失败时创建或更新 Issue
       - name: Notify on failure
         if: failure()
         uses: actions/github-script@v7
+
         with:
           script: |
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
@@ -78,21 +74,21 @@ jobs:
             const title = '🔴 Daily refresh failures';
             const label = 'cron-failure';
 
-            // 找现有的 open issue
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: label,
-              per_page: 1,
-            });
+            const { data: existing } =
+              await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: label,
+                per_page: 1,
+              });
 
             const body = [
               `**${today}** — Daily refresh workflow failed.`,
               ``,
               `[View run logs](${runUrl})`,
               ``,
-              `Triggered by: \`${context.eventName}\`  Run: \`${context.runId}\``,
+              `Triggered by: \`${context.eventName}\` Run: \`${context.runId}\``,
             ].join('\n');
 
             if (existing.length > 0) {
@@ -102,14 +98,21 @@ jobs:
                 issue_number: existing[0].number,
                 body,
               });
-              core.notice(`Appended failure comment to #${existing[0].number}`);
+
+              core.notice(
+                `Appended failure comment to #${existing[0].number}`
+              );
             } else {
-              const { data: created } = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels: [label],
-              });
-              core.notice(`Opened failure issue #${created.number}`);
+              const { data: created } =
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body,
+                  labels: [label],
+                });
+
+              core.notice(
+                `Opened failure issue #${created.number}`
+              );
             }
