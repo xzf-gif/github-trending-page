@@ -1133,10 +1133,7 @@ async function main() {
     );
 
 
-  const enrichmentCache =
-    buildEnrichmentCache(
-      existing
-    );
+  const enrichmentCache = { };
 
 
 
